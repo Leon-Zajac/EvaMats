@@ -35,7 +35,7 @@ def evaluate_change_with_llm(competitor: str, product_name: str, change_type: st
     user_prompt = f"Конкурент: {competitor}. Товар: {product_name}. Тип изменения: {change_type}. Было: {before}, Стало: {after}."
 
     payload = {
-        "model": "openai/gpt-4o-mini",
+        "model": "google/gemini-3.8-flash",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -44,20 +44,25 @@ def evaluate_change_with_llm(competitor: str, product_name: str, change_type: st
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=20)
-        
-        # Если статус не 200, принудительно вызываем исключение
         response.raise_for_status()
         
         result_json = response.json()
-        content = result_json['choices'][0]['message']['content']
         
-        # Очищаем строку от markdown (если модель вернет ```json ... ```)
+        # Безопасно извлекаем контент
+        message = result_json.get('choices', [{}])[0].get('message', {})
+        content = message.get('content')
+        
+        # Если модель промолчала (вернула null)
+        if content is None:
+            logging.error(f"Пустой контент! Сырой ответ OpenRouter: {json.dumps(result_json, ensure_ascii=False)}")
+            return {"importance": "low", "summary": "Ответ заблокирован внутренним фильтром LLM."}
+        
+        # Очищаем строку от markdown, если он есть
         clean_content = content.replace("```json", "").replace("```", "").strip()
         
         return json.loads(clean_content)
         
     except requests.exceptions.HTTPError as http_err:
-        # Логируем точную причину от сервера при ошибке 400
         logging.error(f"HTTP Ошибка от OpenRouter: {http_err.response.text}")
         return {"importance": "low", "summary": "Ошибка HTTP при запросе к LLM."}
     except Exception as e:
