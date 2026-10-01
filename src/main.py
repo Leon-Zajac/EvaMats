@@ -1,29 +1,15 @@
 import yaml
-import json
-import os
 import logging
+from database import init_db, load_state, save_state
 from scraper import fetch_shopify_products, extract_essential_data, get_data_hash
 from llm_extractor import evaluate_change_with_llm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Файл для хранения предыдущего состояния (замена БД на этапе MVP)
-STATE_FILE = "data/state.json"
-
 def load_config():
+    """Загружает список конкурентов из конфигурационного файла."""
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-def load_previous_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_current_state(state):
-    os.makedirs("data", exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
 
 def detect_changes(old_data, new_data):
     """Ищет изменившиеся цены или новые товары обычным кодом (без LLM)."""
@@ -60,9 +46,9 @@ def detect_changes(old_data, new_data):
     return changes
 
 def main():
+    # Инициализируем БД при старте
+    init_db() 
     config = load_config()
-    previous_state = load_previous_state()
-    current_state = {}
     
     for comp in config.get("competitors", []):
         logging.info(f"--- Анализ конкурента: {comp['name']} ---")
@@ -74,12 +60,13 @@ def main():
                 continue
                 
             clean_data = extract_essential_data(raw_data)
-            current_state[comp['name']] = clean_data
             
-            old_data = previous_state.get(comp['name'], [])
+            # Загружаем старые данные прямо из SQLite
+            old_data = load_state(comp['name'])
             
             if not old_data:
-                logging.info("Предыдущих данных нет (первый запуск). Сохраняем как базу.")
+                logging.info("Предыдущих данных нет (первый запуск). Сохраняем в БД.")
+                save_state(comp['name'], clean_data)
                 continue
                 
             # 2. Обнаружение изменений (быстрая проверка по хэшу)
@@ -104,9 +91,9 @@ def main():
                 )
                 print(f"Вывод LLM: {evaluation}\n")
                 
-    # Обновляем локальную "базу данных"
-    save_current_state(current_state)
-    logging.info("Анализ завершен. Состояние сохранено.")
+            # 5. Обновляем БД новыми данными после обработки всех изменений
+            save_state(comp['name'], clean_data)
+            logging.info(f"Состояние для {comp['name']} обновлено в БД.")
 
 if __name__ == "__main__":
     main()
