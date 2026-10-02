@@ -10,42 +10,14 @@ from scraper import (
 )
 from llm_extractor import evaluate_change_with_llm
 from notifier import send_telegram_message
+from comparator import detect_changes
+from storage import log_changes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-def detect_changes(old_data, new_data):
-    changes = []
-    old_dict = {str(item['id']): item for item in old_data}
-    
-    for new_item in new_data:
-        item_id = str(new_item['id'])
-        if item_id in old_dict:
-            old_variants = {v['title']: v for v in old_dict[item_id]['variants']}
-            for new_var in new_item['variants']:
-                var_title = new_var['title']
-                if var_title in old_variants:
-                    old_price = old_variants[var_title]['price']
-                    new_price = new_var['price']
-                    
-                    if old_price != new_price:
-                        changes.append({
-                            "product": f"{new_item['title']} ({var_title})",
-                            "before": old_price,
-                            "after": new_price,
-                            "type": "price_change"
-                        })
-        else:
-            changes.append({
-                "product": new_item['title'],
-                "before": "Не было",
-                "after": new_item['variants'][0]['price'] if new_item['variants'] else "Нет цены",
-                "type": "new_product"
-            })
-    return changes
 
 def main():
     init_db() 
@@ -97,40 +69,52 @@ def main():
         changes = detect_changes(old_data, clean_data)
         
         if changes:
-            # Формируем заголовок сообщения для Telegram
-            alert_msg = f"⚠️ <b>Изменения у конкурента: {comp['name']}</b>\n🔗 <a href='{comp['url']}'>Ссылка на магазин</a>\n\n"
+            # Сохраняем ВСЕ изменения в долгосрочное хранилище
+            log_changes(comp['name'], changes)
             
-            # 3. Анализ через LLM
-            # Ограничиваем до 10 изменений, чтобы не превысить лимит длины сообщения в Telegram
-            for change in changes[:10]: 
-                logging.info(f"Изменение: {change['product']} | {change['before']} -> {change['after']}")
+            # Фильтруем изменения, оставляя только ВАЖНЫЕ (Средняя и Высокая)
+            significant_changes = [c for c in changes if c['importance'] in ['средняя', 'высокая']]
+            
+            if significant_changes:
+                # Формируем заголовок сообщения для Telegram
+                alert_msg = f"⚠️ <b>Важные изменения у конкурента: {comp['name']}</b>\n🔗 <a href='{comp['url']}'>Ссылка на магазин</a>\n\n"
                 
-                evaluation = evaluate_change_with_llm(
-                    competitor=comp['name'],
-                    product_name=change['product'],
-                    change_type=change['type'],
-                    before=change['before'],
-                    after=change['after']
-                )
-                print(f"Вывод LLM: {evaluation}\n")
-                
-                # Добавляем информацию о конкретном товаре в Telegram-сообщение
-                if change['type'] == 'new_product':
-                    alert_msg += f"✨ <b>Новинка:</b> {change['product']}\n💵 Цена: {change['after']}\n"
-                else:
-                    alert_msg += f"🔄 <b>Изменение:</b> {change['product']}\n📉 {change['before']} ➔ {change['after']}\n"
-                
-                # Добавляем мнение LLM (если оно есть)
-                if evaluation:
-                    alert_msg += f"🤖 <i>LLM: {evaluation}</i>\n"
-                
-                alert_msg += "\n" # Отступ между товарами
-                
-            if len(changes) > 10:
-                alert_msg += f"<i>...и еще {len(changes) - 10} изменений. Полный список в логах.</i>\n"
-                
-            # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
-            send_telegram_message(alert_msg)
+                # 3. Анализ через LLM
+                for change in significant_changes[:10]: 
+                    logging.info(f"Важное изменение: {change['product']} | {change['before']} -> {change['after']}")
+                    
+                    evaluation = evaluate_change_with_llm(
+                        competitor=comp['name'],
+                        product_name=change['product'],
+                        change_type=change['type'],
+                        before=change['before'],
+                        after=change['after']
+                    )
+                    
+                    if change['importance'] == 'высокая':
+                        alert_msg += "🚨 <b>ВЫСОКАЯ ВАЖНОСТЬ</b>\n"
+                        
+                    # Добавляем информацию о конкретном товаре в Telegram-сообщение
+                    if change['type'] == 'new_product':
+                        alert_msg += f"✨ <b>Новинка:</b> {change['product']}\n💵 Цена: {change['after']}\n"
+                    elif change['type'] == 'deleted_product':
+                        alert_msg += f"🗑 <b>Удален:</b> {change['product']}\n"
+                    else:
+                        alert_msg += f"🔄 <b>Смена цены:</b> {change['product']}\n📉 {change['before']} ➔ {change['after']}\n"
+                    
+                    # Добавляем мнение LLM (если оно есть)
+                    if evaluation:
+                        alert_msg += f"🤖 <i>LLM: {evaluation}</i>\n"
+                    
+                    alert_msg += "\n" # Отступ между товарами
+                    
+                if len(significant_changes) > 10:
+                    alert_msg += f"<i>...и еще {len(significant_changes) - 10} важных изменений. Полный список в логах.</i>\n"
+                    
+                # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+                send_telegram_message(alert_msg)
+            else:
+                logging.info("Изменения найдены, но их важность низкая (защита от спама). Уведомление не отправлено.")
             
         # 4. Обновление базы
         save_state(comp['name'], clean_data)
