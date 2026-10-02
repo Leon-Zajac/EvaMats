@@ -10,3 +10,11 @@ competitors:
   - name: "Eva Sota"
     url: "https://evasota.pl"
     type: "opencart"
+
+#  - name: "WeatherTech API Test"
+ #   url: "https://www.weathertech.com"
+  #  type: "shopify"
+    
+ # - name: "WeatherTech HTML Test"
+ #   url: "https://www.weathertech.com/floorliner-digitalfit/" 
+ #   type: "html" 
