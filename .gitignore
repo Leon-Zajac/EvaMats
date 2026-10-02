@@ -4,3 +4,5 @@ logs/
 __pycache__/
 .venv/
 venv/
+*_dump.html
+*.html

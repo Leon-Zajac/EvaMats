@@ -2,70 +2,144 @@ import requests
 import hashlib
 import json
 import logging
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-# Настраиваем базовое логирование (требование ТЗ: агент не падает, а пишет ошибку в лог)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Получает список товаров через открытый JSON API Shopify.
+def get_data_hash(data: list) -> str:
+    """Создает хэш от структуры данных для быстрой проверки изменений."""
+    data_string = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(data_string.encode('utf-8')).hexdigest()
+
+# --- 1. SHOPIFY СКРАПЕР ---
 def fetch_shopify_products(base_url: str) -> list:
     url = f"{base_url.rstrip('/')}/products.json"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        return data.get('products', [])
+        return response.json().get("products", [])
     except Exception as e:
-        # Логируем ошибку, чтобы агент не падал
-        logging.error(f"Ошибка при загрузке JSON с {url}: {e}")
+        logging.error(f"Ошибка Shopify скрапера для {base_url}: {e}")
         return []
 
-# Оставляет только важные поля для отслеживания изменений (цены, скидки).
-def extract_essential_data(products: list) -> list:
-    essential_data = []
-    for p in products:
-        item = {
+def extract_shopify_data(raw_products: list) -> list:
+    essential = []
+    for p in raw_products:
+        variants = []
+        for v in p.get("variants", []):
+            variants.append({
+                "title": v.get("title"),
+                "price": str(v.get("price"))
+            })
+        essential.append({
             "id": p.get("id"),
             "title": p.get("title"),
-            "updated_at": p.get("updated_at"),
-            "variants": [
-                {
-                    "title": v.get("title"),
-                    "price": v.get("price"),
-                    # Если compare_at_price не null, значит на товар есть скидка
-                    "compare_at_price": v.get("compare_at_price"), 
-                    "available": v.get("available")
-                } for v in p.get("variants", [])
-            ]
-        }
-        essential_data.append(item)
-    return essential_data
+            "variants": variants
+        })
+    return essential
 
-# Создает хэш данных для быстрой проверки, менялось ли что-то с прошлого запуска.
-def get_data_hash(data: list) -> str:
-    if not data:
-        return ""
-    # Сортируем ключи, чтобы при одинаковых данных хэш всегда был идентичным
-    json_string = json.dumps(data, sort_keys=True)
-    return hashlib.md5(json_string.encode('utf-8')).hexdigest()
+# --- 2. WORDPRESS / WOOCOMMERCE API СКРАПЕР ---
+def fetch_wordpress_products(base_url: str) -> list:
+    url = f"{base_url.rstrip('/')}/wp-json/wc/store/v1/products"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            products = response.json()
+            essential = []
+            for p in products:
+                essential.append({
+                    "id": p.get("id"),
+                    "title": p.get("name"),
+                    "variants": [{
+                        "title": "Default",
+                        "price": str(p.get("prices", {}).get("price", "0") ) / 100
+                    }]
+                })
+            return essential
+    except Exception:
+        pass
+    return []
 
-# Блок для быстрого тестирования кода
-if __name__ == "__main__":
-    target_url = "https://primeeva.pl/"
-    logging.info(f"Сбор данных с {target_url}")
-    
-    raw_products = fetch_shopify_products(target_url)
-    
-    if raw_products:
-        clean_data = extract_essential_data(raw_products)
-        data_hash = get_data_hash(clean_data)
+# --- 3. SITEMAP ПАРСЕР (Для поиска прямых ссылок) ---
+def fetch_urls_from_sitemap(sitemap_url: str, include_pattern: str = "/eva-mats/") -> list:
+    """Скачивает sitemap.xml и возвращает список нужных ссылок."""
+    logging.info(f"Скачиваем карту сайта: {sitemap_url}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(sitemap_url, headers=headers, timeout=15)
+        response.raise_for_status()
         
-        logging.info(f"Успешно собрано товаров: {len(clean_data)}")
-        logging.info(f"Хэш текущего состояния: {data_hash}")
+        soup = BeautifulSoup(response.content, 'xml') 
+        urls = [loc.text for loc in soup.find_all('loc') if include_pattern in loc.text]
         
-        print("\n--- Пример очищенных данных первого товара ---")
-        print(json.dumps(clean_data[0], indent=2, ensure_ascii=False))
-        print("----------------------------------------------\n")
+        logging.info(f"Найдено {len(urls)} ссылок по паттерну {include_pattern}")
+        return urls
+    except Exception as e:
+        logging.error(f"Ошибка при парсинге sitemap {sitemap_url}: {e}")
+        return []
+
+# --- 4. УМНЫЙ HTML ПАРСЕР (Playwright + BeautifulSoup) ---
+def fetch_html_products(base_url: str, type_name: str) -> list:
+    """Использует реальный браузер для обхода JS-рендеринга и лоадеров."""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            page.goto(base_url, wait_until="networkidle", timeout=30000)
+            html_content = page.content()
+            browser.close()
+            
+        soup = BeautifulSoup(html_content, 'html.parser')
+        essential = []
+        
+        # Заменили .good-card на правильный .good_wrapper
+        product_cards = soup.select('.product-layout, .product-item, .item, .product-miniature, li.product, .set-card__details, .good_wrapper')
+        
+        if not product_cards:
+            title_elem = soup.select_one('h1.product_title, h1.product-title, .product-details h1, h1')
+            price_elem = soup.select_one('p.price, span.price, .woocommerce-Price-amount, .current-price, .price-new')
+            
+            if title_elem and price_elem:
+                title = title_elem.get_text(strip=True)
+                price = price_elem.get_text(strip=True)
+                
+                if price.lower().startswith("od "):
+                    price = price[3:].strip()
+                    
+                essential.append({
+                    "id": f"{type_name}_{hashlib.md5(title.encode()).hexdigest()[:8]}",
+                    "title": title,
+                    "variants": [{
+                        "title": "Standard",
+                        "price": price
+                    }]
+                })
+            return essential
+        
+        for idx, card in enumerate(product_cards):
+            title_elem = card.select_one('.name a, .title, h4 a, .product-title, h2.woocommerce-loop-product__title, .set-card__title, .catname')
+            price_elem = card.select_one('.price, .price-new, span.price, .option-price__current, .woocommerce-Price-amount, .set-card__price, .new')
+            
+            if title_elem and price_elem:
+                title = title_elem.get_text(strip=True)
+                price = price_elem.get_text(strip=True)
+                
+                if price.lower().startswith("od "):
+                    price = price[3:].strip()
+                
+                essential.append({
+                    "id": f"{type_name}_{idx}",
+                    "title": title,
+                    "variants": [{
+                        "title": "Standard",
+                        "price": price
+                    }]
+                })
+        return essential
+    except Exception as e:
+        logging.error(f"Ошибка Playwright парсера для {base_url}: {e}")
+        return []

@@ -3,7 +3,10 @@ competitors:
     url: "https://primeeva.pl"
     type: "shopify"
   
-  # Заготовка для остальных конкурентов на будущее
-  # - name: "Eva Sota"
-  #   url: "https://evasota.pl"
-  #   type: "html"
+  - name: "Eva Dywaniki"
+    url: "https://www.evadywaniki.pl/sitemap.xml" 
+    type: "sitemap"
+  
+  - name: "Eva Sota"
+    url: "https://evasota.pl"
+    type: "opencart"
