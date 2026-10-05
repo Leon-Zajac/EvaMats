@@ -2,14 +2,30 @@ competitors:
   - name: "Prime Eva"
     url: "https://primeeva.pl"
     type: "shopify"
-  
+
   - name: "Eva Dywaniki"
-    url: "https://www.evadywaniki.pl/sitemap.xml" 
+    url: "https://www.evadywaniki.pl/sitemap.xml"
     type: "sitemap"
-  
+    product_pattern: ".html"
+
+  # Полный модельный ряд Eva Sota со всеми комплектациями
   - name: "Eva Sota"
-    url: "https://evasota.pl"
-    type: "opencart"
+    url: "https://evasota.pl/sitemap"
+    type: "crawl"
+    rules:
+      follow_patterns:
+        - "/products/"
+      product_pattern: "dywaniki-podlogowe"
+
+  # Аксессуары Eva Sota отдельной витриной
+  - name: "Eva Sota Accessories"
+    url: "https://evasota.pl/aksesuary/"
+    type: "listing"
+    rules:
+      card: ".product-card"
+      title: ".product-card__title"
+      price: ".product-card__price"
+      link: ".product-card__title"
 
 #  - name: "WeatherTech API Test"
  #   url: "https://www.weathertech.com"
