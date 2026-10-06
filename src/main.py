@@ -17,9 +17,10 @@ from scraper import (
     parse_html_crawl,
     fetch_product_page_simple,
     fetch_sitemap_entries,
+    fetch_main_page_promo,
     get_data_hash
 )
-from llm_extractor import evaluate_change_with_llm
+from llm_extractor import evaluate_change_with_llm, evaluate_promo_change_with_llm
 from notifier import send_telegram_message
 from comparator import detect_changes
 from storage import log_changes
@@ -60,13 +61,53 @@ def main():
     init_db() 
     config = load_config()
     
+    # Считываем настройки LLM из config.yaml 
+    llm_config = config.get("llm", {})
+    model_name = llm_config.get("model", "google/gemini-3.8-flash")
+    
     for comp in config.get("competitors", []):
         comp_start_time = time.time()
         comp_name = comp["name"]
         comp_type = comp.get("type", "").lower()
         logging.info(f"--- Анализ конкурента: {comp_name} ---")
         
-        # 1. Сбор данных в зависимости от движка сайта
+        # ---------------------------------------------------------
+        # ШАГ 0. ПРОВЕРКА ГЛОБАЛЬНЫХ ОФФЕРОВ И БАННЕРОВ 
+        # ---------------------------------------------------------
+        promo_data = fetch_main_page_promo(comp["url"])
+        if promo_data and promo_data.get("promo_text"):
+            old_promo_state = load_state(f"{comp_name}_promo")
+            old_promo_text = old_promo_state[0].get("promo_text", "") if old_promo_state else ""
+            old_promo_hash = old_promo_state[0].get("hash", "") if old_promo_state else ""
+
+            if not old_promo_state:
+                logging.info(f"Сохранен базовый промо-оффер главной страницы для {comp_name}.")
+                save_state(f"{comp_name}_promo", [promo_data])
+            elif old_promo_hash != promo_data.get("hash"):
+                logging.info(f"🚨 Обнаружено изменение оффера/акции у {comp_name}!")
+                
+                if not dry_run:
+                    analysis = evaluate_promo_change_with_llm(
+                        competitor=comp_name,
+                        before=old_promo_text,
+                        after=promo_data.get("promo_text", ""),
+                        model_name=model_name
+                    )
+                    
+                    promo_msg = (
+                        f"📣 <b>Смена акции / УТП у {comp_name}</b>\n"
+                        f"🔗 <a href='{comp['url']}'>Перейти на сайт</a>\n\n"
+                        f"<b>Было:</b> {old_promo_text}\n\n"
+                        f"<b>Стало:</b> {promo_data.get('promo_text', '')}\n\n"
+                        f"🤖 <i>LLM: {analysis.get('summary', 'Обновление маркетинговых материалов.')}</i>"
+                    )
+                    send_telegram_message(promo_msg)
+                
+                save_state(f"{comp_name}_promo", [promo_data])
+
+        # ---------------------------------------------------------
+        # ШАГ 1. СБОР КАТАЛОГА ТОВАРОВ
+        # ---------------------------------------------------------
         clean_data = []
         
         if comp_type == "shopify":
@@ -84,9 +125,9 @@ def main():
             
         elif comp_type == "sitemap":
             pattern = comp.get("product_pattern", ".html")
-            logging.info(f"Скачиваем и парсим sitemap: {comp['url']}")
-            sitemap_entries = fetch_sitemap_entries(comp["url"], pattern)
-            logging.info(f"Всего ссылок в sitemap по фильтру: {len(sitemap_entries)}")
+            s_url = comp.get("sitemap_url", comp["url"])
+            logging.info(f"Скачиваем и парсим sitemap: {s_url}")
+            sitemap_entries = fetch_sitemap_entries(s_url, pattern)
 
             # Фильтрация по lastmod (пропуск страниц, которые не менялись)
             urls_to_scrape = []
@@ -101,6 +142,12 @@ def main():
             skipped_count = len(sitemap_entries) - len(urls_to_scrape)
             if skipped_count > 0:
                 logging.info(f"⚡ Пропущено {skipped_count} страниц (не менялись по lastmod).")
+
+            # Ограничение количества страниц (если задано в конфиге для безопасных тестов)
+            max_limit = comp.get("max_items")
+            if max_limit and len(urls_to_scrape) > max_limit:
+                logging.info(f"Применен лимит max_items из конфига: обрабатываем первые {max_limit} ссылок.")
+                urls_to_scrape = urls_to_scrape[:max_limit]
 
             logging.info(f"Отправляем на парсинг: {len(urls_to_scrape)} страниц.")
 
@@ -132,8 +179,14 @@ def main():
             logging.warning(f"Данные не собраны. Проверьте парсер для {comp['url']}")
             continue
 
-        # 2. Загрузка старых данных и сравнение
+        # ---------------------------------------------------------
+        # ШАГ 2. ЗАГРУЗКА ПРЕДЫДУЩЕГО СНИМКА И СРАВНЕНИЕ
+        # ---------------------------------------------------------
         old_data = load_state(comp_name)
+
+        if old_data and len(clean_data) < len(old_data) * 0.5:
+            logging.error(f"⚠️ Собрано слишком мало товаров ({len(clean_data)} против {len(old_data)} ранее). Вероятен сбой сети. Пропуск детектора для исключения ложных удалений.")
+            continue
         
         if not old_data:
             logging.info(f"Предыдущих данных нет (первый запуск для {comp_name}). Сохраняем в БД.")
@@ -142,18 +195,19 @@ def main():
             continue
                         
         if get_data_hash(old_data) == get_data_hash(clean_data):
-            logging.info(f"✅ Изменений на сайте {comp_name} нет.")
+            logging.info(f"✅ Изменений в каталоге {comp_name} нет.")
             logging.info(f"⏱ Время обработки {comp_name}: {round(time.time() - comp_start_time, 2)} сек.")
             continue
             
         logging.info(f"⚠️ Обнаружены изменения на {comp_name}! Ищем разницу...")
+        
         changes = detect_changes(old_data, clean_data)
         
         if changes:
-            # Сохраняем ВСЕ изменения в долгосрочное хранилище
+            # Сохраняем ВСЕ изменения в постоянное хранилище
             log_changes(comp_name, changes)
             
-            # Фильтруем изменения, оставляя только важные (средняя и высокая)
+            # Фильтруем изменения: для уведомлений оставляем среднюю и высокую важность
             significant_changes = [c for c in changes if c.get('importance') in ['средняя', 'высокая']]
             
             if significant_changes:
@@ -162,7 +216,9 @@ def main():
                 else:
                     alert_msg = f"⚠️ <b>Важные изменения у конкурента: {comp_name}</b>\n🔗 <a href='{comp['url']}'>Ссылка на магазин</a>\n\n"
                     
-                    # 3. Анализ через LLM
+                    # ---------------------------------------------------------
+                    # ШАГ 3. АНАЛИЗ ЧЕРЕЗ LLM И ОТПРАВКА УВЕДОМЛЕНИЙ
+                    # ---------------------------------------------------------
                     for change in significant_changes[:10]: 
                         logging.info(f"Важное изменение: {change['product']} | {change['before']} -> {change['after']}")
                         
@@ -171,7 +227,8 @@ def main():
                             product_name=change['product'],
                             change_type=change['type'],
                             before=str(change['before']),
-                            after=str(change['after'])
+                            after=str(change['after']),
+                            model_name=model_name
                         )
                         
                         if change.get('importance') == 'высокая':
@@ -182,9 +239,10 @@ def main():
                         elif change['type'] == 'deleted_product':
                             alert_msg += f"🗑 <b>Удален:</b> {change['product']}\n"
                         else:
-                            alert_msg += f"🔄 <b>Смена цены:</b> {change['product']}\n📉 {change['before']} ➔ {change['after']}\n"
+                            diff_badge = f" ({change.get('diff_percent')})" if change.get('diff_percent') else ""
+                            alert_msg += f"🔄 <b>Смена цены:</b> {change['product']}\n📉 {change['before']} ➔ {change['after']}{diff_badge}\n"
                         
-                        # Извлекаем понятный текстовый вывод LLM вместо сырого словаря
+                        # Человекочитаемый вывод от LLM
                         if evaluation and isinstance(evaluation, dict):
                             summary_text = evaluation.get("summary", "")
                             if summary_text:
@@ -193,14 +251,15 @@ def main():
                         alert_msg += "\n"
                         
                     if len(significant_changes) > 10:
-                        alert_msg += f"<i>...и еще {len(significant_changes) - 10} важных изменений. Полный список в логах.</i>\n"
+                        alert_msg += f"<i>...и еще {len(significant_changes) - 10} важных изменений. Полный список в storage/*.jsonl</i>\n"
                         
-                    # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ В TELEGRAM
                     send_telegram_message(alert_msg)
             else:
                 logging.info("Изменения найдены, но их важность низкая (защита от спама). Уведомление не отправлено.")
             
-        # 4. Обновление базы
+        # ---------------------------------------------------------
+        # ШАГ 4. ОБНОВЛЕНИЕ БАЗЫ ДАННЫХ
+        # ---------------------------------------------------------
         save_state(comp_name, clean_data)
         logging.info(f"Состояние для {comp_name} обновлено в БД.")
         logging.info(f"⏱ Время обработки {comp_name}: {round(time.time() - comp_start_time, 2)} сек.")

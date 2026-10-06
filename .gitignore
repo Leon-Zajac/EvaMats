@@ -6,3 +6,4 @@ __pycache__/
 venv/
 *_dump.html
 *.html
+storage/

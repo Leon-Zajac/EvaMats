@@ -4,7 +4,7 @@ import logging
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
-
+import time
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -24,27 +24,53 @@ def get_data_hash(data: list) -> str:
 
 # --- 1. SHOPIFY СКРАПЕР ---
 def fetch_shopify_products(base_url: str) -> list:
-    """Выгружает все товары магазина через пагинацию Shopify API."""
+    """Выгружает все товары магазина через пагинацию Shopify API с защитой от 429 Too Many Requests."""
     all_products = []
     page = 1
+    max_retries = 3
 
     while True:
         url = f"{base_url.rstrip('/')}/products.json?limit=50&page={page}"
-        try:
-            response = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
-            response.raise_for_status()
-            products = response.json().get("products", [])
-            if not products:
+        retry_count = 0
+        success = False
+
+        while retry_count < max_retries:
+            try:
+                response = requests.get(url, headers=DEFAULT_HEADERS, timeout=12)
+                
+                # Если сработал Rate Limit от Shopify
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 4))
+                    logging.warning(f"Shopify [{base_url}]: Превышен лимит запросов (429). Ожидание {retry_after} сек...")
+                    time.sleep(retry_after)
+                    retry_count += 1
+                    continue
+
+                response.raise_for_status()
+                products = response.json().get("products", [])
+                
+                if not products:
+                    logging.info(f"Shopify [{base_url}]: пагинация завершена на стр. {page}. Всего: {len(all_products)} товаров.")
+                    return all_products
+
+                all_products.extend(products)
+                page += 1
+                success = True
+                
+                # Вежливая пауза между страницами (согласно п. 10.3 ТЗ)
+                time.sleep(0.6)
                 break
-            all_products.extend(products)
-            page += 1
-        except Exception as e:
-            logging.error(f"Ошибка Shopify скрапера для {base_url} (стр. {page}): {e}")
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Ошибка сети Shopify для {base_url} (стр. {page}, попытка {retry_count + 1}): {e}")
+                retry_count += 1
+                time.sleep(2)
+
+        if not success:
+            logging.error(f"Не удалось выгрузить страницу {page} для {base_url} после {max_retries} попыток.")
             break
 
-    logging.info(f"Shopify [{base_url}]: успешно выгружено {len(all_products)} товаров.")
     return all_products
-
 
 # --- 2. WORDPRESS / WOOCOMMERCE API СКРАПЕР ---
 def fetch_wordpress_products(base_url: str) -> list:
@@ -91,8 +117,8 @@ def fetch_sitemap_entries(sitemap_url: str, include_pattern: str = ".html") -> l
                 # Исключаем статьи блога и оставляем целевые страницы
                 if (not include_pattern or include_pattern in url_text) and "/blog/" not in url_text:
                     entries.append({
-                     "url": url_text,
-                     "lastmod": lastmod_text
+                        "url": url_text,
+                        "lastmod": lastmod_text
                     })
 
         logging.info(f"Найдено {len(entries)} ссылок по паттерну {include_pattern}")
@@ -140,25 +166,18 @@ def extract_schema_org_data(soup: BeautifulSoup) -> dict | None:
 
 
 def fetch_product_page_simple(url: str, type_name: str) -> list:
-    """Универсальный сбор данных карточки: 1. Schema.org -> 2. Конфигуратор -> 3. Резервные селекторы."""
+    """
+    Универсальный парсер карточек e-commerce:
+    1. Стандартные опции комплектаций (OpenCart/Custom inputs с data-price/data-name).
+    2. Стандартная микроразметка Schema.org (JSON-LD).
+    3. Резервные блоки цен витрины.
+    """
     try:
         response = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
         if response.status_code != 200:
             return []
 
         soup = BeautifulSoup(response.content, "html.parser")
-
-        # 1. ПРИОРИТЕТ: Универсальная микроразметка Schema.org (не ломается при смене верстки)
-        schema_data = extract_schema_org_data(soup)
-        if schema_data:
-            return [{
-                "id": f"{type_name}_{hashlib.md5(url.encode()).hexdigest()[:8]}",
-                "title": schema_data["title"],
-                "variants": [{"title": "Komplet standard", "price": schema_data["price"]}],
-                "url": url
-            }]
-
-        # 2. ФОЛБЭК: Если Schema.org нет, извлекаем через H1 и блоки цен/конфигуратора
         title_elem = soup.select_one("h1.product_title, h1.product-title, .product-details h1, h1")
         if not title_elem:
             return []
@@ -166,25 +185,54 @@ def fetch_product_page_simple(url: str, type_name: str) -> list:
         title = title_elem.get_text(strip=True)
         variants = []
 
-        # Блоки конфигуратора опций (complect)
-        complect_blocks = soup.select('div.child_block[class*="complect-"], div[class*="front-mat-option"]')
-        for block in complect_blocks:
-            text = block.get_text(" ", strip=True)
-            if "zł" in text:
-                parts = text.rsplit(" ", 2)
-                if len(parts) >= 2 and ("zł" in parts[-1] or "zł" in parts[-2]):
-                    price_str = f"{parts[-2]} {parts[-1]}" if "zł" in parts[-1] else parts[-1]
-                    var_name = text.replace(price_str, "").strip()
-                    if var_name and price_str:
-                        variants.append({"title": var_name, "price": price_str})
+        # 1. ПРИОРИТЕТ: Стандартные радиокнопки/чекбоксы опций комплектаций (Evasota, OpenCart)
+        # Ищем элементы, содержащие и название комплекта, и цену
+        option_inputs = soup.select('input[data-price][data-name], input[name^="option"][data-price]')
+        for inp in option_inputs:
+            price_val = inp.get("data-price", "0")
+            try:
+                price_float = float(price_val)
+            except ValueError:
+                price_float = 0.0
 
-        # Резервный поиск по стандартным классам цен
+            # Отсекаем мелкие допы/аксессуары (+30 zł за шильдики/подпятники)
+            # Оставляем только базовые варианты ковриков (> 100 zł) или группу комплектов (set)
+            is_set_group = inp.get("data-option_code") == "set"
+            if price_float > 99 or is_set_group:
+                var_name = inp.get("data-name") or inp.get("value", "Комплект")
+                # Форматируем красивую цену
+                clean_price = f"{int(price_float) if price_float.is_integer() else price_float:.2f} zł"
+                variants.append({
+                    "title": var_name.strip(),
+                    "price": clean_price
+                })
+
+        # 2. ПРИОРИТЕТ: Если явных инпутов опций нет — универсальная Schema.org JSON-LD
         if not variants:
-            main_price_selectors = [".price-new", ".product-price", "span[itemprop='price']", ".current-price", ".price"]
+            schema_data = extract_schema_org_data(soup)
+            if schema_data and schema_data.get("price"):
+                variants.append({
+                    "title": "Komplet standard",
+                    "price": schema_data["price"]
+                })
+
+        # 3. ФОЛБЭК: Текстовые блоки цен страницы
+        if not variants:
+            main_price_selectors = [
+                ".option-price__current",
+                ".price-new",
+                ".product-price",
+                "span[itemprop='price']",
+                ".current-price",
+                ".price"
+            ]
             for sel in main_price_selectors:
                 elem = soup.select_one(sel)
                 if elem and "zł" in elem.get_text():
-                    variants.append({"title": "Komplet standard", "price": elem.get_text(strip=True)})
+                    variants.append({
+                        "title": "Komplet standard",
+                        "price": elem.get_text(strip=True)
+                    })
                     break
 
         if variants:
@@ -195,8 +243,9 @@ def fetch_product_page_simple(url: str, type_name: str) -> list:
                 "url": url
             }]
     except Exception as e:
-        logging.error(f"Ошибка requests парсера для {url}: {e}")
+        logging.error(f"Ошибка парсера карточки {url}: {e}")
     return []
+
 
 # --- 5. УНИВЕРСАЛЬНЫЙ СКРАПЕР ВИТРИН (Listing / Accessories) ---
 def parse_html_listing(config: dict) -> list:
@@ -268,7 +317,6 @@ def parse_html_crawl(config: dict) -> list:
 
     logging.info(f"Crawl [{config.get('name')}]: найдено {len(category_links)} разделов для поиска моделей.")
 
-    # Сбор ссылок на карточки товаров
     product_urls = set()
     product_pattern = rules.get("product_pattern", "")
 
@@ -330,3 +378,57 @@ def scrape_competitor(comp_config: dict) -> list:
     else:
         logging.warning(f"Неизвестный тип скрапера '{c_type}' для {comp_config.get('name')}")
         return []
+
+
+# --- 8. ДЕТЕКТОР ГЛОБАЛЬНЫХ ОФФЕРОВ И ПРОМО-БАННЕРОВ (п. 6.2 ТЗ) ---
+def fetch_main_page_promo(base_url: str) -> dict:
+    """Извлекает ключевые текстовые блоки главной страницы: H1, анонс-бары, промо-баннеры и УТП."""
+    if base_url.endswith(".xml"):
+        from urllib.parse import urlparse
+        p = urlparse(base_url)
+        base_url = f"{p.scheme}://{p.netloc}/"
+    try:
+        response = requests.get(base_url, headers=DEFAULT_HEADERS, timeout=12)
+        if response.status_code != 200:
+            return {}
+
+        soup = BeautifulSoup(response.content, "html.parser")
+
+        # 1. Полосы анонсов и скидок в шапке (announcement bars, top banners, promo alerts)
+        promo_selectors = [
+            ".announcement-bar",
+            ".top-bar",
+            ".header-banner",
+            ".promo-bar",
+            ".alert-banner",
+            "[class*='announc']",
+            "[class*='promo']",
+            "[class*='banner']"
+        ]
+
+        banner_texts = []
+        for sel in promo_selectors:
+            for elem in soup.select(sel):
+                t = elem.get_text(" ", strip=True)
+                if 5 < len(t) < 250 and not any(skip in t.lower() for skip in ["cookie", "polityka", "javascript"]):
+                    if t not in banner_texts:
+                        banner_texts.append(t)
+
+        # 2. Главные заголовки и УТП
+        h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1") if h.get_text(strip=True)]
+        h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2") if 5 < len(h.get_text(strip=True)) < 150][:3]
+
+        combined_text = " | ".join(filter(None, [
+            " ".join(banner_texts[:3]),
+            " ".join(h1[:2]),
+            " ".join(h2[:3])
+        ]))
+
+        return {
+            "url": base_url,
+            "promo_text": combined_text.strip(),
+            "hash": hashlib.md5(combined_text.strip().encode("utf-8")).hexdigest() if combined_text else ""
+        }
+    except Exception as e:
+        logging.error(f"Ошибка сбора промо-оффера для {base_url}: {e}")
+        return {}

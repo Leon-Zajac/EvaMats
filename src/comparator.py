@@ -1,81 +1,105 @@
+import re
 import logging
+from typing import List, Dict, Any
 
-def clean_price(price_str):
-    """Очищает строку с ценой и превращает ее в число для математики."""
-    if not isinstance(price_str, str):
-        return float(price_str)
-    # Убираем валюту, пробелы и меняем запятую на точку
-    cleaned = ''.join(c for c in price_str if c.isdigit() or c in '.,')
-    cleaned = cleaned.replace(',', '.')
+def parse_price_value(val: Any) -> float:
+    """Извлекает строго числовое значение цены для исключения строковых ложных срабатываний."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    
+    # Очистка строки: удаляем валюты, пробелы, заменяем запятую
+    clean = re.sub(r"[^\d.,]", "", str(val)).replace(",", ".")
     try:
-        return float(cleaned) if cleaned else 0.0
+        # Если в строке несколько точек, оставляем последнюю
+        if clean.count(".") > 1:
+            parts = clean.split(".")
+            clean = "".join(parts[:-1]) + "." + parts[-1]
+        return float(clean) if clean else 0.0
     except ValueError:
         return 0.0
 
-def evaluate_importance(change_type, before, after):
-    """Определяет важность согласно п. 6.3 ТЗ."""
-    if change_type == "price_change":
-        old_f = clean_price(before)
-        new_f = clean_price(after)
-        
-        if old_f > 0:
-            diff_percent = abs(new_f - old_f) / old_f * 100
-            if diff_percent > 10:
-                return "высокая"  # Изменение цены > 10%
-            else:
-                return "низкая"   # Косметическое изменение цены
-                
-    elif change_type in ["new_product", "deleted_product"]:
-        return "средняя"  # Добавлен или удален товар[cite: 15]
-        
-    return "низкая"
+def normalize_title(title: str) -> str:
+    """Убирает мусорные слова для точного сопоставления карточек."""
+    t = title.lower()
+    t = re.sub(r"(dywaniki|eva|samochodowe|mata|do|\bomevo\b|®|™)", "", t)
+    return re.sub(r"\s+", " ", t).strip()
 
-def detect_changes(old_data, new_data):
-    """Сравнивает данные, находит разницу и классифицирует её важность."""
+def detect_changes(old_data: List[Dict], new_data: List[Dict]) -> List[Dict]:
+    """Интеллектуальное сравнение данных с защитой от ложных срабатываний."""
     changes = []
-    old_dict = {str(item['id']): item for item in old_data}
-    new_dict = {str(item['id']): item for item in new_data}
     
-    # 1. Ищем новые товары и изменения цен
-    for item_id, new_item in new_dict.items():
-        if item_id in old_dict:
-            old_variants = {v['title']: v for v in old_dict[item_id]['variants']}
-            for new_var in new_item['variants']:
-                var_title = new_var['title']
-                if var_title in old_variants:
-                    old_price = old_variants[var_title]['price']
-                    new_price = new_var['price']
+    # Строим маппинг как по ID, так и по нормализованному названию
+    old_by_id = {str(item.get("id")): item for item in old_data}
+    old_by_title = {normalize_title(item.get("title", "")): item for item in old_data if item.get("title")}
+    
+    new_by_id = {str(item.get("id")): item for item in new_data}
+    
+    # 1. Поиск изменений цен и модификаций
+    for item in new_data:
+        item_id = str(item.get("id"))
+        norm_title = normalize_title(item.get("title", ""))
+        
+        # Находим старую версию товара (по ID или по нормализованному имени)
+        old_item = old_by_id.get(item_id) or old_by_title.get(norm_title)
+        
+        if old_item:
+            old_variants = {v.get("title", "Standard"): v for v in old_item.get("variants", [])}
+            new_variants = {v.get("title", "Standard"): v for v in item.get("variants", [])}
+            
+            for v_title, n_var in new_variants.items():
+                if v_title in old_variants:
+                    o_var = old_variants[v_title]
+                    old_price_num = parse_price_value(o_var.get("price"))
+                    new_price_num = parse_price_value(n_var.get("price"))
                     
-                    if old_price != new_price:
-                        importance = evaluate_importance("price_change", old_price, new_price)
+                    # Проверяем реальное математическое изменение цены (порог > 1 zł, чтобы игнорировать округления)
+                    if abs(new_price_num - old_price_num) >= 1.0 and old_price_num > 0:
+                        diff_pct = round(((new_price_num - old_price_num) / old_price_num) * 100, 1)
+                        
+                        # Классификация важности согласно п. 6.3 ТЗ
+                        if abs(diff_pct) >= 10.0:
+                            importance = "высокая"
+                        elif abs(diff_pct) >= 3.0:
+                            importance = "средняя"
+                        else:
+                            importance = "низкая"
+                            
                         changes.append({
-                            "product": f"{new_item['title']} ({var_title})",
-                            "before": old_price,
-                            "after": new_price,
+                            "product": f"{item.get('title')} ({v_title})",
+                            "before": f"{old_price_num:.2f} zł",
+                            "after": f"{new_price_num:.2f} zł",
+                            "diff_percent": f"{diff_pct:+}%",
                             "type": "price_change",
-                            "importance": importance
+                            "importance": importance,
+                            "url": item.get("url", "")
                         })
         else:
-            # Товар есть в новых данных, но нет в старых
-            importance = evaluate_importance("new_product", None, None)
+            # Новый товар в каталоге
+            price_repr = item.get("variants", [{}])[0].get("price", "Уточняется")
             changes.append({
-                "product": new_item['title'],
-                "before": "Не было",
-                "after": new_item['variants'][0]['price'] if new_item['variants'] else "Нет цены",
+                "product": item.get("title", "Неизвестный товар"),
+                "before": "Не было в каталоге",
+                "after": str(price_repr),
                 "type": "new_product",
-                "importance": importance
+                "importance": "средняя",  # п. 6.3 ТЗ: Добавлен товар -> средняя
+                "url": item.get("url", "")
             })
             
-    # 2. Ищем удаленные товары
-    for item_id, old_item in old_dict.items():
-        if item_id not in new_dict:
-            importance = evaluate_importance("deleted_product", None, None)
+    # 2. Поиск удаленных товаров
+    for old_item in old_data:
+        old_id = str(old_item.get("id"))
+        old_norm_title = normalize_title(old_item.get("title", ""))
+        
+        if old_id not in new_by_id and old_norm_title not in [normalize_title(x.get("title", "")) for x in new_data]:
             changes.append({
-                "product": old_item['title'],
-                "before": old_item['variants'][0]['price'] if old_item['variants'] else "Был",
-                "after": "Удален",
+                "product": old_item.get("title", "Товар"),
+                "before": "Был в каталоге",
+                "after": "Удален / Снят с продажи",
                 "type": "deleted_product",
-                "importance": importance
+                "importance": "средняя",  # п. 6.3 ТЗ: Удален товар -> средняя
+                "url": old_item.get("url", "")
             })
             
     return changes

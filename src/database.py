@@ -59,3 +59,14 @@ def save_page_lastmod(url: str, lastmod: str):
             VALUES (?, ?)
             ON CONFLICT(url) DO UPDATE SET lastmod = excluded.lastmod, updated_at = CURRENT_TIMESTAMP
         ''', (url, lastmod))
+
+def get_saved_promo(competitor: str) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute('SELECT data FROM state WHERE competitor = ?', (f"{competitor}_promo",))
+        row = cursor.fetchone()
+        return json.loads(row[0]) if row else None
+
+def save_promo_state(competitor: str, data: dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('INSERT OR REPLACE INTO state (competitor, data) VALUES (?, ?)', 
+                     (f"{competitor}_promo", json.dumps(data, ensure_ascii=False)))
