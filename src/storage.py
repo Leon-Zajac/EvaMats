@@ -13,7 +13,6 @@ def log_changes(competitor_name, changes):
     """Дописывает историю изменений в лог-файл конкурента."""
     init_storage()
     file_path = os.path.join(STORAGE_DIR, f"{competitor_name.lower().replace(' ', '_')}_changes.jsonl")
-    
     timestamp = datetime.now().isoformat()
     
     with open(file_path, "a", encoding="utf-8") as f:
@@ -21,6 +20,8 @@ def log_changes(competitor_name, changes):
             log_entry = {
                 "timestamp": timestamp,
                 "competitor": competitor_name,
+                "market": "PL",
+                "currency": "PLN",
                 **change
             }
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
