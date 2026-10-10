@@ -61,7 +61,7 @@ def main():
     init_db() 
     config = load_config()
     
-    # Считываем настройки LLM из config.yaml 
+    # Считываем настройки LLM из config.yaml (дефолт - рабочая модель)
     llm_config = config.get("llm", {})
     model_name = llm_config.get("model", "google/gemini-3.8-flash")
     
@@ -162,15 +162,27 @@ def main():
 
             # Параллельный сбор страниц с карточками
             MAX_WORKERS = 6
+            freshly_scraped = []
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = [executor.submit(process_single_url, entry) for entry in urls_to_scrape]
                 for future in as_completed(futures):
                     try:
                         result = future.result()
                         if result:
-                            clean_data.extend(result)
+                            freshly_scraped.extend(result)
                     except Exception as err:
                         logging.error(f"Ошибка при параллельном парсинге страницы: {err}")
+
+            # Инкрементальное объединение с предыдущим состоянием
+            old_cached = load_state(comp_name)
+            if old_cached:
+                merged_dict = {str(item.get("id")): item for item in old_cached}
+                for fresh_item in freshly_scraped:
+                    merged_dict[str(fresh_item.get("id"))] = fresh_item
+                clean_data = list(merged_dict.values())
+                logging.info(f"Актуализирован снимок каталога {comp_name}: всего {len(clean_data)} товаров.")
+            else:
+                clean_data = freshly_scraped
         else:
             logging.warning(f"Неизвестный тип конкурента: {comp_type}")
             continue

@@ -1,13 +1,14 @@
 import hashlib
 import json
 import logging
+import re
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin
-import time
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -22,7 +23,7 @@ def get_data_hash(data: list) -> str:
     return hashlib.md5(data_string.encode("utf-8")).hexdigest()
 
 
-# --- 1. SHOPIFY СКРАПЕР ---
+# --- 1. SHOPIFY СКРАПЕР (С мягким обходом лимитов) ---
 def fetch_shopify_products(base_url: str) -> list:
     """Выгружает все товары магазина через пагинацию Shopify API с защитой от 429 Too Many Requests."""
     all_products = []
@@ -37,18 +38,19 @@ def fetch_shopify_products(base_url: str) -> list:
         while retry_count < max_retries:
             try:
                 response = requests.get(url, headers=DEFAULT_HEADERS, timeout=12)
-                
-                # Если сработал Rate Limit от Shopify
+
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", 4))
-                    logging.warning(f"Shopify [{base_url}]: Превышен лимит запросов (429). Ожидание {retry_after} сек...")
-                    time.sleep(retry_after)
+                    # Ограничиваем ожидание максимум 10 секундами, чтобы не висеть по 60 секунд
+                    sleep_time = min(retry_after, 10)
+                    logging.warning(f"Shopify [{base_url}]: Лимит запросов (429). Ожидание {sleep_time} сек...")
+                    time.sleep(sleep_time)
                     retry_count += 1
                     continue
 
                 response.raise_for_status()
                 products = response.json().get("products", [])
-                
+
                 if not products:
                     logging.info(f"Shopify [{base_url}]: пагинация завершена на стр. {page}. Всего: {len(all_products)} товаров.")
                     return all_products
@@ -56,8 +58,8 @@ def fetch_shopify_products(base_url: str) -> list:
                 all_products.extend(products)
                 page += 1
                 success = True
-                
-                # Вежливая пауза между страницами (согласно п. 10.3 ТЗ)
+
+                # Пауза между страницами согласно п. 10.3 ТЗ
                 time.sleep(0.6)
                 break
 
@@ -71,6 +73,7 @@ def fetch_shopify_products(base_url: str) -> list:
             break
 
     return all_products
+
 
 # --- 2. WORDPRESS / WOOCOMMERCE API СКРАПЕР ---
 def fetch_wordpress_products(base_url: str) -> list:
@@ -97,7 +100,7 @@ def fetch_wordpress_products(base_url: str) -> list:
 
 # --- 3. SITEMAP ПАРСЕР (С поддержкой lastmod) ---
 def fetch_sitemap_entries(sitemap_url: str, include_pattern: str = ".html") -> list[dict]:
-    """Скачивает sitemap.xml и возвращает список ссылок, игнорируя проблемы с XML namespaces."""
+    """Скачивает sitemap.xml и возвращает список ссылок без XML namespace проблем."""
     logging.info(f"Скачиваем карту сайта: {sitemap_url}")
     try:
         response = requests.get(sitemap_url, headers=DEFAULT_HEADERS, timeout=15)
@@ -114,7 +117,6 @@ def fetch_sitemap_entries(sitemap_url: str, include_pattern: str = ".html") -> l
                 url_text = loc.text.strip()
                 lastmod_text = lastmod.text.strip() if lastmod and lastmod.text else None
 
-                # Исключаем статьи блога и оставляем целевые страницы
                 if (not include_pattern or include_pattern in url_text) and "/blog/" not in url_text:
                     entries.append({
                         "url": url_text,
@@ -129,14 +131,13 @@ def fetch_sitemap_entries(sitemap_url: str, include_pattern: str = ".html") -> l
 
 
 def fetch_urls_from_sitemap(sitemap_url: str, include_pattern: str = "/eva-mats/") -> list:
-    """Возвращает только список URL из карты сайта."""
     entries = fetch_sitemap_entries(sitemap_url, include_pattern)
     return [e["url"] for e in entries]
 
 
-# --- 4. ЛЕГКОВЕСНЫЙ ПОТОКОБЕЗОПАСНЫЙ ПАРСЕР ОДНОЙ КАРТОЧКИ ---
+# --- 4. ПАРСЕР ОДНОЙ КАРТОЧКИ (СО СТАБИЛЬНЫМ ID) ---
 def extract_schema_org_data(soup: BeautifulSoup) -> dict | None:
-    """Извлекает структурированные данные Schema.org (JSON-LD) без привязки к HTML-верстке."""
+    """Извлекает структурированные данные Schema.org (JSON-LD)."""
     for script in soup.find_all("script", type="application/ld+json"):
         if not script.string:
             continue
@@ -149,17 +150,19 @@ def extract_schema_org_data(soup: BeautifulSoup) -> dict | None:
                     offers = node.get("offers", {})
                     if isinstance(offers, list) and offers:
                         offers = offers[0]
-                    
+
                     price = offers.get("price") or offers.get("lowPrice")
                     currency = offers.get("priceCurrency", "zł")
                     if currency == "PLN":
                         currency = "zł"
 
                     if name and price:
-                        return {
-                            "title": name.strip(),
-                            "price": f"{price} {currency}".strip()
-                        }
+                        p_float = float(str(price).replace(",", "."))
+                        if p_float >= 99:
+                            return {
+                                "title": name.strip(),
+                                "price": f"{int(p_float) if p_float.is_integer() else p_float:.2f} {currency}".strip()
+                            }
         except (ValueError, TypeError):
             continue
     return None
@@ -167,10 +170,8 @@ def extract_schema_org_data(soup: BeautifulSoup) -> dict | None:
 
 def fetch_product_page_simple(url: str, type_name: str) -> list:
     """
-    Универсальный парсер карточек e-commerce:
-    1. Стандартные опции комплектаций (OpenCart/Custom inputs с data-price/data-name).
-    2. Стандартная микроразметка Schema.org (JSON-LD).
-    3. Резервные блоки цен витрины.
+    Универсальный парсер карточек товаров.
+    Использует артикул OpenCart или slug названия для стабильного ID, исключая мигания.
     """
     try:
         response = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
@@ -182,11 +183,11 @@ def fetch_product_page_simple(url: str, type_name: str) -> list:
         if not title_elem:
             return []
 
-        title = title_elem.get_text(strip=True)
+        base_title = title_elem.get_text(strip=True)
         variants = []
+        seen_variants = set()
 
         # 1. ПРИОРИТЕТ: Стандартные радиокнопки/чекбоксы опций комплектаций (Evasota, OpenCart)
-        # Ищем элементы, содержащие и название комплекта, и цену
         option_inputs = soup.select('input[data-price][data-name], input[name^="option"][data-price]')
         for inp in option_inputs:
             price_val = inp.get("data-price", "0")
@@ -195,17 +196,18 @@ def fetch_product_page_simple(url: str, type_name: str) -> list:
             except ValueError:
                 price_float = 0.0
 
-            # Отсекаем мелкие допы/аксессуары (+30 zł за шильдики/подпятники)
-            # Оставляем только базовые варианты ковриков (> 100 zł) или группу комплектов (set)
             is_set_group = inp.get("data-option_code") == "set"
             if price_float > 99 or is_set_group:
-                var_name = inp.get("data-name") or inp.get("value", "Комплект")
-                # Форматируем красивую цену
+                var_name = inp.get("data-name") or inp.get("value", "Komplet standard")
                 clean_price = f"{int(price_float) if price_float.is_integer() else price_float:.2f} zł"
-                variants.append({
-                    "title": var_name.strip(),
-                    "price": clean_price
-                })
+                
+                v_key = (var_name.strip(), clean_price)
+                if v_key not in seen_variants:
+                    seen_variants.add(v_key)
+                    variants.append({
+                        "title": var_name.strip(),
+                        "price": clean_price
+                    })
 
         # 2. ПРИОРИТЕТ: Если явных инпутов опций нет — универсальная Schema.org JSON-LD
         if not variants:
@@ -236,20 +238,32 @@ def fetch_product_page_simple(url: str, type_name: str) -> list:
                     break
 
         if variants:
+            # Нормализуем URL: убираем дублирующие префиксы /products/ и GET-параметры
+            canonical_url = url.split("?")[0].replace("/products/", "/")
+
+            # 1. Приоритет: извлекаем уникальный числовой ID OpenCart из URL (например, '6402' из '...-6402-pl')
+            product_id_match = re.search(r"-(\d+)-pl", canonical_url)
+
+            if product_id_match:
+                stable_id = f"{type_name}_{product_id_match.group(1)}"
+            else:
+                # 2. Фолбэк для страниц без артикула: хэш от очищенного заголовка
+                clean_title_slug = re.sub(r"[^\w\s]", "", base_title.lower()).strip()
+                clean_title_slug = re.sub(r"\s+", "_", clean_title_slug)
+                stable_id = f"{type_name}_{hashlib.md5(clean_title_slug.encode('utf-8')).hexdigest()[:10]}"
+
             return [{
-                "id": f"{type_name}_{hashlib.md5(url.encode()).hexdigest()[:8]}",
-                "title": title,
+                "id": stable_id,
+                "title": base_title,
                 "variants": variants,
-                "url": url
+                "url": canonical_url
             }]
     except Exception as e:
         logging.error(f"Ошибка парсера карточки {url}: {e}")
     return []
 
-
-# --- 5. УНИВЕРСАЛЬНЫЙ СКРАПЕР ВИТРИН (Listing / Accessories) ---
+# --- 5. СКРАПЕР ВИТРИН (Listing / Accessories) ---
 def parse_html_listing(config: dict) -> list:
-    """Парсит прямые страницы со списками карточек (каталог, аксессуары, распродажи)."""
     url = config["url"]
     rules = config.get("rules", {})
     try:
@@ -275,8 +289,11 @@ def parse_html_listing(config: dict) -> list:
                 price = price[3:].strip()
 
             link = urljoin(url, link_el.get("href", "")) if (link_el and link_el.get("href")) else url
+            clean_slug = re.sub(r"[^\w\s]", "", title.lower()).strip()
+            item_id = f"{config.get('name', 'item')}_{hashlib.md5(clean_slug.encode()).hexdigest()[:8]}"
+            
             items.append({
-                "id": f"{config.get('name', 'item')}_{idx}",
+                "id": item_id,
                 "title": title,
                 "variants": [{"title": "Default", "price": price}],
                 "url": link
@@ -286,9 +303,8 @@ def parse_html_listing(config: dict) -> list:
     return items
 
 
-# --- 6. УНИВЕРСАЛЬНЫЙ МНОГОУРОВНЕВЫЙ ОБХОДЧИК КАТАЛОГОВ (Crawl) ---
+# --- 6. ОБХОДЧИК КАТАЛОГОВ (Crawl) ---
 def parse_html_crawl(config: dict) -> list:
-    """Обходит многоуровневый каталог: входная страница -> категории -> карточки моделей."""
     start_url = config["url"]
     rules = config.get("rules", {})
     follow_patterns = rules.get("follow_patterns", [])
@@ -353,7 +369,6 @@ def parse_html_crawl(config: dict) -> list:
 
 # --- 7. ЕДИНЫЙ ДИСПЕТЧЕР СКРАПИНГА ---
 def scrape_competitor(comp_config: dict) -> list:
-    """Маршрутизатор скраперов по типу, указанному в config.yaml."""
     c_type = comp_config.get("type", "").lower()
     url = comp_config.get("url")
 
@@ -382,9 +397,8 @@ def scrape_competitor(comp_config: dict) -> list:
 
 # --- 8. ДЕТЕКТОР ГЛОБАЛЬНЫХ ОФФЕРОВ И ПРОМО-БАННЕРОВ (п. 6.2 ТЗ) ---
 def fetch_main_page_promo(base_url: str) -> dict:
-    """Извлекает ключевые текстовые блоки главной страницы: H1, анонс-бары, промо-баннеры и УТП."""
+    """Извлекает промо-тексты, скидки и H1 с главной страницы."""
     if base_url.endswith(".xml"):
-        from urllib.parse import urlparse
         p = urlparse(base_url)
         base_url = f"{p.scheme}://{p.netloc}/"
     try:
@@ -394,7 +408,6 @@ def fetch_main_page_promo(base_url: str) -> dict:
 
         soup = BeautifulSoup(response.content, "html.parser")
 
-        # 1. Полосы анонсов и скидок в шапке (announcement bars, top banners, promo alerts)
         promo_selectors = [
             ".announcement-bar",
             ".top-bar",
@@ -414,7 +427,6 @@ def fetch_main_page_promo(base_url: str) -> dict:
                     if t not in banner_texts:
                         banner_texts.append(t)
 
-        # 2. Главные заголовки и УТП
         h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1") if h.get_text(strip=True)]
         h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2") if 5 < len(h.get_text(strip=True)) < 150][:3]
 

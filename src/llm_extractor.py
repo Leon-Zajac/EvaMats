@@ -108,7 +108,7 @@ def evaluate_promo_change_with_llm(
         logging.warning("OPENROUTER_API_KEY не задан. LLM анализ промо пропущен.")
         return {"importance": "medium", "summary": "Обнаружено обновление промо-блока (без LLM)."}
 
-    url = "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
