@@ -81,7 +81,7 @@ EvaMats/
 
 ### 2. Клонирование и установка зависимостей
 ```bash
-git clone <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
+git clone https://github.com/Leon-Zajac/EvaMats
 cd EvaMats
 
 # Создание виртуального окружения
