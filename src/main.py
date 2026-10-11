@@ -85,6 +85,13 @@ def main():
                 save_state(f"{comp_name}_promo", [promo_data])
             elif old_promo_hash != promo_data.get("hash"):
                 logging.info(f"🚨 Обнаружено изменение оффера/акции у {comp_name}!")
+                log_changes(comp_name, [{
+                             "product": "Главная страница (Промо-оффер / УТП)",
+                             "before": old_promo_text,
+                             "after": promo_data.get("promo_text", ""),
+                             "type": "promo_change",
+                            "importance": "средняя"
+                            }])
                 
                 if not dry_run:
                     analysis = evaluate_promo_change_with_llm(
